@@ -38,6 +38,14 @@ var (
 		Name: "max_unconfirmed_blocks",
 		Help: "The max number of blocks any currently unconfirmed transaction has been unconfirmed for",
 	})
+	promPipelineRunsQueued = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pipeline_runs_queued",
+		Help: "The total number of pipline runs that are awaiting execution",
+	})
+	promPipelineTaskRunsQueued = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pipeline_task_runs_queued",
+		Help: "The total number of pipline task runs that are awaiting execution",
+	})
 )
 
 func (defaultBackend) SetUnconfirmedTransactions(n int64) {
@@ -72,6 +80,7 @@ func (pr *promReporter) OnNewLongestChain(ctx context.Context, head models.Head)
 	err := multierr.Combine(
 		errors.Wrap(pr.reportPendingEthTxes(ctx), "reportPendingEthTxes failed"),
 		errors.Wrap(pr.reportMaxUnconfirmedBlocks(ctx, head), "reportMaxUnconfirmedBlocks failed"),
+		errors.Wrap(pr.reportPipelineRunStats(ctx), "reportPipelineRunStats failed"),
 	)
 
 	if err != nil {
@@ -122,5 +131,34 @@ AND eth_txes.state = 'unconfirmed'`)
 		blocksUnconfirmed = head.Number - earliestUnconfirmedTxBlock.ValueOrZero()
 	}
 	pr.backend.SetMaxUnconfirmedBlocks(blocksUnconfirmed)
+	return nil
+}
+
+func (pr *promReporter) reportPipelineRunStats(ctx context.Context) (err error) {
+	rows, err := pr.db.QueryContext(ctx, `
+SELECT pipeline_run_id FROM pipeline_task_runs WHERE finished_at IS NULL
+`)
+	if err != nil {
+		return errors.Wrap(err, "failed to query for pipeline_run_id")
+	}
+	defer func() {
+		err = multierr.Combine(err, rows.Close())
+	}()
+
+	pipelineTaskRunsQueued := 0
+	pipelineRunsQueuedSet := make(map[int32]struct{})
+	for rows.Next() {
+		var pipelineRunID int32
+		if err := rows.Scan(&pipelineRunID); err != nil {
+			return errors.Wrap(err, "unexpected error scanning row")
+		}
+		pipelineTaskRunsQueued++
+		pipelineRunsQueuedSet[pipelineRunID] = struct{}{}
+	}
+	pipelineRunsQueued := len(pipelineRunsQueuedSet)
+
+	promPipelineTaskRunsQueued.Set(float64(pipelineTaskRunsQueued))
+	promPipelineRunsQueued.Set(float64(pipelineRunsQueued))
+
 	return nil
 }
